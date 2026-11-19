@@ -1,3 +1,195 @@
+"""
+ACPTelecom - Radar Financeiro
+Backend FastAPI para Render.
+
+Endpoints:
+  GET /api/shark     -> S&P 500 futuro, VIX e histórico D-1 do Ibovespa
+  GET /api/win-flow  -> alias de compatibilidade para /api/shark
+  GET /api/macro     -> Selic, IPCA, PTAX venda e IBC-Br (Banco Central/SGS)
+  GET /health        -> saúde da aplicação
+
+Observação:
+  yfinance fornece dados de mercado com possíveis atrasos e limitações.
+  Este servidor não fornece agressão real, book ou negócios do WIN/B3.
+"""
+
+import asyncio
+import os
+import threading
+import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import httpx
+import yfinance as yf
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+# ---------------------------------------------------------------------
+# Configuração
+# ---------------------------------------------------------------------
+
+TTL = int(os.getenv("CACHE_TTL", "60"))
+MACRO_TTL = int(os.getenv("MACRO_CACHE_TTL", "900"))  # 15 minutos
+ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",")
+    if origin.strip()
+]
+SP = ZoneInfo("America/Sao_Paulo")
+
+app = FastAPI(title="ACP Radar API", version="2.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ORIGINS or ["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
+_shark_cache = {"t": 0.0, "data": None}
+_shark_lock = threading.Lock()
+
+_macro_cache = {"t": 0.0, "data": None}
+_macro_lock = asyncio.Lock()
+
+BCB_BASE = "https://api.bcb.gov.br/dados/serie/bcdata.sgs"
+
+# Séries SGS:
+# 4189 = Meta Selic (% a.a.)
+# 433   = IPCA mensal (% a.m.)
+# 1     = Taxa de câmbio - Dólar venda (PTAX)
+# 24364 = IBC-Br dessazonalizado
+BCB_SERIES = {
+    "selic": {
+        "code": "4189",
+        "label": "Meta Selic",
+        "unit": "% a.a.",
+    },
+    "ipca": {
+        "code": "433",
+        "label": "IPCA mensal",
+        "unit": "% a.m.",
+    },
+    "usd_ptax": {
+        "code": "1",
+        "label": "Dólar PTAX venda",
+        "unit": "R$/US$",
+    },
+    "ibc_br": {
+        "code": "24364",
+        "label": "IBC-Br dessazonalizado",
+        "unit": "índice",
+    },
+}
+
+
+# ---------------------------------------------------------------------
+# Shark / mercado
+# ---------------------------------------------------------------------
+
+def _hist(symbol: str, period: str = "20d"):
+    """Candles diários recentes de um símbolo do Yahoo Finance."""
+    df = yf.Ticker(symbol).history(
+        period=period,
+        interval="1d",
+        auto_adjust=False,
+    )
+    df = df.dropna(subset=["Close"])
+    if len(df) < 2:
+        raise ValueError(f"dados insuficientes para {symbol}")
+    return df
+
+
+def _last_and_pct(symbol: str):
+    """Último preço e variação % contra o fechamento anterior."""
+    closes = _hist(symbol, period="10d")["Close"]
+    last = float(closes.iloc[-1])
+    previous = float(closes.iloc[-2])
+    return last, (last / previous - 1) * 100
+
+
+def _build_shark() -> dict:
+    """Monta resposta; falha em um ativo não derruba os demais."""
+    now = datetime.now(SP)
+    out = {
+        "ok": False,
+        "errors": {},
+        "updated": now.isoformat(timespec="seconds"),
+        "source": "Yahoo Finance",
+    }
+
+    try:
+        last, pct = _last_and_pct("ES=F")
+        out["sp_fut_price"] = round(last, 2)
+        out["sp_fut_pct"] = round(pct, 2)
+    except Exception as exc:
+        out["errors"]["sp"] = str(exc)
+
+    try:
+        last, pct = _last_and_pct("^VIX")
+        out["vix"] = round(last, 2)
+        out["vix_pct"] = round(pct, 2)
+    except Exception as exc:
+        out["errors"]["vix"] = str(exc)
+
+    try:
+        df = _hist("^BVSP", period="20d")
+        last_day = df.index[-1].date()
+
+        # Se o candle do dia ainda está em formação, usa o candle anterior
+        # como D-1. Horário de referência mantido do servidor original.
+        in_session = (
+            last_day == now.date()
+            and (now.hour * 60 + now.minute) < 18 * 60 + 30
+        )
+        d1_row = df.iloc[-2] if in_session else df.iloc[-1]
+
+        close_d1 = round(float(d1_row["Close"]), 2)
+        high_d1 = round(float(d1_row["High"]), 2)
+        low_d1 = round(float(d1_row["Low"]), 2)
+
+        # Mantém os nomes originais para não quebrar o consumidor atual.
+        out["ibov_close_d1"] = close_d1
+        out["ibov_high_d1"] = high_d1
+        out["ibov_low_d1"] = low_d1
+        out["ibov_amp_d1"] = round(high_d1 - low_d1, 2)
+        out["ibov_last"] = round(float(df["Close"].iloc[-1]), 2)
+        out["ibov_prev"] = round(float(df["Close"].iloc[-2]), 2)
+
+        rows = []
+        for idx, row in df.tail(10).iloc[::-1].iterrows():
+            rows.append({
+                "date": idx.strftime("%d/%m/%Y"),
+                "open": round(float(row["Open"]), 2),
+                "high": round(float(row["High"]), 2),
+                "low": round(float(row["Low"]), 2),
+                "close": round(float(row["Close"]), 2),
+                "volume": int(row["Volume"]) if row["Volume"] > 0 else 0,
+            })
+        out["history"] = rows
+
+    except Exception as exc:
+        out["errors"]["ibov"] = str(exc)
+
+    out["ok"] = len(out["errors"]) < 3
+    return out
+
+
+def _get_shark_data():
+    with _shark_lock:
+        stale = (
+            _shark_cache["data"] is None
+            or time.time() - _shark_cache["t"] > TTL
+        )
+        if stale:
+            data = _build_shark()
+            # Preserva último resultado válido se uma atualização falhar.
+            if data["ok"] or _shark_cache["data"] is None:
+                _shark_cache["t"] = time.time()
+                _shark_cache["data"] = data
+        return _shark_cache["data"]
+
+
 @app.get("/api/shark")
 def shark():
     return _get_shark_data()
