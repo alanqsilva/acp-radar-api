@@ -136,8 +136,6 @@ def _build_shark() -> dict:
         df = _hist("^BVSP", period="20d")
         last_day = df.index[-1].date()
 
-        # Se o candle do dia ainda está em formação, usa o candle anterior
-        # como D-1. Horário de referência mantido do servidor original.
         in_session = (
             last_day == now.date()
             and (now.hour * 60 + now.minute) < 18 * 60 + 30
@@ -148,7 +146,6 @@ def _build_shark() -> dict:
         high_d1 = round(float(d1_row["High"]), 2)
         low_d1 = round(float(d1_row["Low"]), 2)
 
-        # Mantém os nomes originais para não quebrar o consumidor atual.
         out["ibov_close_d1"] = close_d1
         out["ibov_high_d1"] = high_d1
         out["ibov_low_d1"] = low_d1
@@ -183,7 +180,6 @@ def _get_shark_data():
         )
         if stale:
             data = _build_shark()
-            # Preserva último resultado válido se uma atualização falhar.
             if data["ok"] or _shark_cache["data"] is None:
                 _shark_cache["t"] = time.time()
                 _shark_cache["data"] = data
@@ -208,11 +204,23 @@ def win_flow():
 async def _fetch_bcb_series(
     client: httpx.AsyncClient,
     code: str,
+    retries: int = 2,
 ) -> dict:
     url = f"{BCB_BASE}.{code}/dados/ultimos/1?formato=json"
-    response = await client.get(url)
-    response.raise_for_status()
-    rows = response.json()
+    last_exc = None
+
+    for attempt in range(retries + 1):
+        try:
+            response = await client.get(url)
+            response.raise_for_status()
+            rows = response.json()
+            break
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                await asyncio.sleep(0.8 * (attempt + 1))
+            else:
+                raise last_exc
 
     if not rows:
         return {"value": None, "date": None}
@@ -225,7 +233,6 @@ async def _fetch_bcb_series(
     except (TypeError, ValueError):
         value = None
 
-    # SGS costuma devolver a data como DD/MM/AAAA.
     raw_date = row.get("data")
     try:
         parsed_date = datetime.strptime(raw_date, "%d/%m/%Y").date().isoformat()
@@ -239,11 +246,15 @@ async def _fetch_bcb_series(
 
 
 async def _build_macro() -> dict:
-    timeout = httpx.Timeout(12.0, connect=5.0)
+    timeout = httpx.Timeout(15.0, connect=6.0)
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 ACPTelecomRadar/2.0",
+    }
 
     async with httpx.AsyncClient(
         timeout=timeout,
-        headers={"Accept": "application/json"},
+        headers=headers,
     ) as client:
         keys = list(BCB_SERIES)
         results = await asyncio.gather(
@@ -304,18 +315,18 @@ async def _get_macro_data():
         if stale:
             try:
                 data = await _build_macro()
-                # Atualiza o cache mesmo com falha parcial, para expor os erros.
                 _macro_cache["t"] = time.time()
                 _macro_cache["data"] = data
             except Exception as exc:
-                if _macro_cache["data"] is None:
-                    return {
-                        "ok": False,
-                        "as_of": datetime.now(SP).isoformat(timespec="seconds"),
-                        "series": {},
-                        "errors": {"macro": str(exc)},
-                        "meta": {"source": "Banco Central do Brasil — SGS"},
-                    }
+                if _macro_cache["data"] is not None:
+                    return _macro_cache["data"]
+                return {
+                    "ok": False,
+                    "as_of": datetime.now(SP).isoformat(timespec="seconds"),
+                    "series": {},
+                    "errors": {"macro": str(exc)},
+                    "meta": {"source": "Banco Central do Brasil — SGS"},
+                }
 
         return _macro_cache["data"]
 
