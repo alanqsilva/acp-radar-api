@@ -3,13 +3,14 @@ ACPTelecom - Radar Financeiro
 Backend FastAPI para Render.
 
 Endpoints:
-  GET /api/shark     -> S&P 500 futuro, VIX e histórico D-1 do Ibovespa
+  GET /api/shark     -> S&P 500 futuro, VIX, histórico D-1 do Ibovespa e cotações B3 (brapi)
   GET /api/win-flow  -> alias de compatibilidade para /api/shark
-  GET /api/macro     -> Selic, IPCA, PTAX venda e IBC-Br (Banco Central/SGS)
+  GET /api/macro     -> Selic, IPCA, PTAX venda, IBC-Br e setor externo (Banco Central/SGS)
   GET /health        -> saúde da aplicação
 
 Observação:
-  yfinance fornece dados de mercado com possíveis atrasos e limitações.
+  yfinance e brapi fornecem dados de mercado com possíveis atrasos e limitações.
+  Séries mensais do BCB (setor externo/inflação/atividade) são contexto estrutural.
   Este servidor não fornece agressão real, book ou negócios do WIN/B3.
 """
 
@@ -31,6 +32,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 TTL = int(os.getenv("CACHE_TTL", "60"))
 MACRO_TTL = int(os.getenv("MACRO_CACHE_TTL", "900"))  # 15 minutos
+BRAPI_TTL = int(os.getenv("BRAPI_CACHE_TTL", "90"))
+BRAPI_TOKEN = os.getenv("BRAPI_TOKEN", "").strip()
+
 ORIGINS = [
     origin.strip()
     for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",")
@@ -38,7 +42,7 @@ ORIGINS = [
 ]
 SP = ZoneInfo("America/Sao_Paulo")
 
-app = FastAPI(title="ACP Radar API", version="2.0.0")
+app = FastAPI(title="ACP Radar API", version="2.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ORIGINS or ["*"],
@@ -49,16 +53,21 @@ app.add_middleware(
 _shark_cache = {"t": 0.0, "data": None}
 _shark_lock = threading.Lock()
 
+_brapi_cache = {"t": 0.0, "data": None}
+_brapi_lock = threading.Lock()
+
 _macro_cache = {"t": 0.0, "data": None}
 _macro_lock = asyncio.Lock()
 
 BCB_BASE = "https://api.bcb.gov.br/dados/serie/bcdata.sgs"
 
 # Séries SGS:
-# 4189 = Meta Selic (% a.a.)
+# 4189  = Meta Selic (% a.a.)
 # 433   = IPCA mensal (% a.m.)
 # 1     = Taxa de câmbio - Dólar venda (PTAX)
 # 24364 = IBC-Br dessazonalizado
+# 22707 = Balança comercial - saldo mensal (US$ milhões)
+# 22701 = Transações correntes - saldo mensal (US$ milhões)
 BCB_SERIES = {
     "selic": {
         "code": "4189",
@@ -80,11 +89,34 @@ BCB_SERIES = {
         "label": "IBC-Br dessazonalizado",
         "unit": "índice",
     },
+    "balanca_comercial": {
+        "code": "22707",
+        "label": "Balança comercial (saldo)",
+        "unit": "US$ milhões",
+    },
+    "transacoes_correntes": {
+        "code": "22701",
+        "label": "Transações correntes (saldo)",
+        "unit": "US$ milhões",
+    },
 }
+
+B3_PESOS_TICKERS = [
+    "VALE3",
+    "PETR4",
+    "ITUB4",
+    "PETR3",
+    "BBDC4",
+    "B3SA3",
+    "ELET3",
+    "BBAS3",
+    "MGLU3",
+]
+B3_FREE_FALLBACK_TICKERS = ["VALE3", "PETR4", "ITUB4", "MGLU3"]
 
 
 # ---------------------------------------------------------------------
-# Shark / mercado
+# Shark / mercado + brapi (pesos da B3)
 # ---------------------------------------------------------------------
 
 def _hist(symbol: str, period: str = "20d"):
@@ -108,6 +140,70 @@ def _last_and_pct(symbol: str):
     return last, (last / previous - 1) * 100
 
 
+def _fetch_brapi_quotes(tickers: list[str], timeout_s: float = 10.0) -> dict:
+    """Busca cotações na brapi.dev (usa Bearer token quando configurado)."""
+    symbols = ",".join(tickers)
+    url = f"https://brapi.dev/api/quote/{symbols}"
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 ACPTelecomRadar/2.1",
+    }
+    if BRAPI_TOKEN:
+        headers["Authorization"] = f"Bearer {BRAPI_TOKEN}"
+
+    with httpx.Client(timeout=timeout_s, headers=headers) as client:
+        resp = client.get(url)
+        resp.raise_for_status()
+        payload = resp.json()
+
+    results = payload.get("results") or []
+    quotes = {}
+    for item in results:
+        sym = item.get("symbol")
+        if sym:
+            price = item.get("regularMarketPrice")
+            change = item.get("regularMarketChangePercent")
+            quotes[sym] = {
+                "price": round(float(price), 2) if price is not None else None,
+                "change": round(float(change), 2) if change is not None else None,
+                "name": item.get("shortName") or item.get("longName") or sym,
+            }
+    return quotes
+
+
+def _get_b3_quotes() -> tuple[dict, str | None]:
+    """Retorna cotações B3 com cache e fallback seguro."""
+    with _brapi_lock:
+        stale = (
+            _brapi_cache["data"] is None
+            or (time.time() - _brapi_cache["t"]) > BRAPI_TTL
+        )
+        if stale:
+            try:
+                fresh = _fetch_brapi_quotes(B3_PESOS_TICKERS)
+                if fresh:
+                    _brapi_cache["data"] = fresh
+                    _brapi_cache["t"] = time.time()
+                    return _brapi_cache["data"], None
+            except Exception as exc:
+                if not BRAPI_TOKEN:
+                    try:
+                        free_quotes = _fetch_brapi_quotes(B3_FREE_FALLBACK_TICKERS)
+                        if free_quotes:
+                            _brapi_cache["data"] = free_quotes
+                            _brapi_cache["t"] = time.time()
+                            return _brapi_cache["data"], None
+                    except Exception as free_exc:
+                        if _brapi_cache["data"] is not None:
+                            return _brapi_cache["data"], str(free_exc)
+                        return {}, str(free_exc)
+                if _brapi_cache["data"] is not None:
+                    return _brapi_cache["data"], str(exc)
+                return {}, str(exc)
+
+        return _brapi_cache["data"] or {}, None
+
+
 def _build_shark() -> dict:
     """Monta resposta; falha em um ativo não derruba os demais."""
     now = datetime.now(SP)
@@ -115,7 +211,7 @@ def _build_shark() -> dict:
         "ok": False,
         "errors": {},
         "updated": now.isoformat(timespec="seconds"),
-        "source": "Yahoo Finance",
+        "source": "Yahoo Finance + BCB SGS + brapi",
     }
 
     try:
@@ -167,6 +263,11 @@ def _build_shark() -> dict:
 
     except Exception as exc:
         out["errors"]["ibov"] = str(exc)
+
+    b3_quotes, brapi_err = _get_b3_quotes()
+    out["b3_quotes"] = b3_quotes
+    if brapi_err:
+        out["errors"]["brapi"] = brapi_err
 
     out["ok"] = len(out["errors"]) < 3
     return out
@@ -249,7 +350,7 @@ async def _build_macro() -> dict:
     timeout = httpx.Timeout(15.0, connect=6.0)
     headers = {
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 ACPTelecomRadar/2.0",
+        "User-Agent": "Mozilla/5.0 ACPTelecomRadar/2.1",
     }
 
     async with httpx.AsyncClient(
@@ -298,7 +399,7 @@ async def _build_macro() -> dict:
             "notes": [
                 "A data exibida é a data da observação publicada pelo SGS.",
                 "As séries possuem periodicidades e defasagens distintas.",
-                "IBC-Br é indicador de atividade econômica, não cotação intradiária.",
+                "IBC-Br e séries de setor externo (balança comercial / transações correntes) são estruturais/mensais, não fluxo intradiário.",
                 "Dados macroeconômicos não representam agressão ou fluxo do WIN.",
             ],
         },
