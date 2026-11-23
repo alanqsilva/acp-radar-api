@@ -1,23 +1,20 @@
 """
-ACPTelecom - Radar Financeiro
+ACPTelecom - Radar Financeiro (v2.2.0)
 Backend FastAPI para Render.
 
 Endpoints:
-  GET /api/shark     -> S&P 500 futuro, VIX, histórico D-1 do Ibovespa e cotações B3 (brapi)
+  GET /api/shark     -> S&P 500, Nasdaq, VIX, DXY, EWZ, Petróleo, Câmbio Real-Time,
+                        Histórico D-1 IBOV + Níveis Fibonacci + Cotações B3 (brapi)
   GET /api/win-flow  -> alias de compatibilidade para /api/shark
-  GET /api/macro     -> Selic, IPCA, PTAX venda, IBC-Br e setor externo (Banco Central/SGS)
+  GET /api/macro     -> Selic, IPCA, PTAX venda, IBC-Br e setor externo (BCB/SGS)
   GET /health        -> saúde da aplicação
-
-Observação:
-  yfinance e brapi fornecem dados de mercado com possíveis atrasos e limitações.
-  Séries mensais do BCB (setor externo/inflação/atividade) são contexto estrutural.
-  Este servidor não fornece agressão real, book ou negócios do WIN/B3.
 """
 
 import asyncio
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -30,7 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # Configuração
 # ---------------------------------------------------------------------
 
-TTL = int(os.getenv("CACHE_TTL", "60"))
+TTL = int(os.getenv("CACHE_TTL", "45"))  # 45s para dados globais e câmbio
 MACRO_TTL = int(os.getenv("MACRO_CACHE_TTL", "900"))  # 15 minutos
 BRAPI_TTL = int(os.getenv("BRAPI_CACHE_TTL", "90"))
 BRAPI_TOKEN = os.getenv("BRAPI_TOKEN", "").strip()
@@ -42,7 +39,7 @@ ORIGINS = [
 ]
 SP = ZoneInfo("America/Sao_Paulo")
 
-app = FastAPI(title="ACP Radar API", version="2.1.0")
+app = FastAPI(title="ACP Radar API", version="2.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ORIGINS or ["*"],
@@ -60,35 +57,13 @@ _macro_cache = {"t": 0.0, "data": None}
 _macro_lock = asyncio.Lock()
 
 BCB_BASE = "https://api.bcb.gov.br/dados/serie/bcdata.sgs"
+AWESOME_FX_URL = "https://economia.awesomeapi.com.br/last/USD-BRL,EUR-BRL,GBP-BRL"
 
-# Séries SGS:
-# 4189  = Meta Selic (% a.a.)
-# 433   = IPCA mensal (% a.m.)
-# 1     = Taxa de câmbio - Dólar venda (PTAX)
-# 24364 = IBC-Br dessazonalizado
-# 22707 = Balança comercial - saldo mensal (US$ milhões)
-# 22701 = Transações correntes - saldo mensal (US$ milhões)
 BCB_SERIES = {
-    "selic": {
-        "code": "4189",
-        "label": "Meta Selic",
-        "unit": "% a.a.",
-    },
-    "ipca": {
-        "code": "433",
-        "label": "IPCA mensal",
-        "unit": "% a.m.",
-    },
-    "usd_ptax": {
-        "code": "1",
-        "label": "Dólar PTAX venda",
-        "unit": "R$/US$",
-    },
-    "ibc_br": {
-        "code": "24364",
-        "label": "IBC-Br dessazonalizado",
-        "unit": "índice",
-    },
+    "selic": {"code": "4189", "label": "Meta Selic", "unit": "% a.a."},
+    "ipca": {"code": "433", "label": "IPCA mensal", "unit": "% a.m."},
+    "usd_ptax": {"code": "1", "label": "Dólar PTAX venda", "unit": "R$/US$"},
+    "ibc_br": {"code": "24364", "label": "IBC-Br dessazonalizado", "unit": "índice"},
     "balanca_comercial": {
         "code": "22707",
         "label": "Balança comercial (saldo)",
@@ -116,7 +91,7 @@ B3_FREE_FALLBACK_TICKERS = ["VALE3", "PETR4", "ITUB4", "MGLU3"]
 
 
 # ---------------------------------------------------------------------
-# Shark / mercado + brapi (pesos da B3)
+# Helpers de Coleta e Cálculo Quantitativo
 # ---------------------------------------------------------------------
 
 def _hist(symbol: str, period: str = "20d"):
@@ -132,12 +107,47 @@ def _hist(symbol: str, period: str = "20d"):
     return df
 
 
-def _last_and_pct(symbol: str):
+def _last_and_pct(symbol: str) -> tuple[float, float]:
     """Último preço e variação % contra o fechamento anterior."""
     closes = _hist(symbol, period="10d")["Close"]
     last = float(closes.iloc[-1])
     previous = float(closes.iloc[-2])
-    return last, (last / previous - 1) * 100
+    return round(last, 2), round((last / previous - 1) * 100, 2)
+
+
+def _calc_fibonacci_levels(high: float, low: float) -> dict:
+    """Calcula níveis institucionais de Fibonacci usados na mesa WIN/IBOV."""
+    amp = high - low
+    return {
+        "amp": round(amp, 2),
+        "ext_minus_11_8": round(low - (amp * 0.118), 2),
+        "ret_38_2": round(low + (amp * 0.382), 2),
+        "ret_50_0": round(low + (amp * 0.500), 2),
+        "ret_61_8": round(low + (amp * 0.618), 2),
+        "ext_plus_111_8": round(low + (amp * 1.118), 2),
+    }
+
+
+def _fetch_realtime_fx(timeout_s: float = 6.0) -> dict:
+    """Busca USD/BRL, EUR/BRL e GBP/BRL em tempo real via AwesomeAPI."""
+    headers = {"Accept": "application/json", "User-Agent": "ACPTelecomRadar/2.2"}
+    with httpx.Client(timeout=timeout_s, headers=headers) as client:
+        resp = client.get(AWESOME_FX_URL)
+        resp.raise_for_status()
+        raw = resp.json()
+
+    fx = {}
+    for pair_key, out_key in [("USDBRL", "usd_brl"), ("EURBRL", "eur_brl"), ("GBPBRL", "gbp_brl")]:
+        item = raw.get(pair_key)
+        if item:
+            fx[out_key] = {
+                "price": round(float(item["bid"]), 4),
+                "change": round(float(item["pctChange"]), 2),
+                "high": round(float(item["high"]), 4),
+                "low": round(float(item["low"]), 4),
+                "timestamp": item.get("create_date"),
+            }
+    return fx
 
 
 def _fetch_brapi_quotes(tickers: list[str], timeout_s: float = 10.0) -> dict:
@@ -146,7 +156,7 @@ def _fetch_brapi_quotes(tickers: list[str], timeout_s: float = 10.0) -> dict:
     url = f"https://brapi.dev/api/quote/{symbols}"
     headers = {
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 ACPTelecomRadar/2.1",
+        "User-Agent": "Mozilla/5.0 ACPTelecomRadar/2.2",
     }
     if BRAPI_TOKEN:
         headers["Authorization"] = f"Bearer {BRAPI_TOKEN}"
@@ -205,29 +215,63 @@ def _get_b3_quotes() -> tuple[dict, str | None]:
 
 
 def _build_shark() -> dict:
-    """Monta resposta; falha em um ativo não derruba os demais."""
+    """Coleta paralela dos ativos globais, câmbio real-time, IBOV e B3."""
     now = datetime.now(SP)
     out = {
         "ok": False,
         "errors": {},
         "updated": now.isoformat(timespec="seconds"),
-        "source": "Yahoo Finance + BCB SGS + brapi",
+        "source": "Yahoo Finance + AwesomeAPI FX + BCB SGS + brapi",
     }
 
-    try:
-        last, pct = _last_and_pct("ES=F")
-        out["sp_fut_price"] = round(last, 2)
-        out["sp_fut_pct"] = round(pct, 2)
-    except Exception as exc:
-        out["errors"]["sp"] = str(exc)
+    global_symbols = {
+        "sp_fut": "ES=F",
+        "nq_fut": "NQ=F",
+        "vix": "^VIX",
+        "dxy": "DX-Y.NYB",
+        "ewz": "EWZ",
+        "wti": "CL=F",
+        "brent": "BZ=F",
+    }
 
-    try:
-        last, pct = _last_and_pct("^VIX")
-        out["vix"] = round(last, 2)
-        out["vix_pct"] = round(pct, 2)
-    except Exception as exc:
-        out["errors"]["vix"] = str(exc)
+    def fetch_global_task(key: str, sym: str):
+        try:
+            return key, _last_and_pct(sym), None
+        except Exception as exc:
+            return key, None, str(exc)
 
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [
+            pool.submit(fetch_global_task, k, s)
+            for k, s in global_symbols.items()
+        ]
+        fx_future = pool.submit(_fetch_realtime_fx)
+        b3_future = pool.submit(_get_b3_quotes)
+
+        for fut in futures:
+            key, val, err = fut.result()
+            if val is not None:
+                if key == "vix":
+                    out["vix"] = val[0]
+                    out["vix_pct"] = val[1]
+                else:
+                    out[f"{key}_price"] = val[0]
+                    out[f"{key}_pct"] = val[1]
+            else:
+                out["errors"][key] = err
+
+        try:
+            out["fx"] = fx_future.result()
+        except Exception as exc:
+            out["fx"] = {}
+            out["errors"]["fx"] = str(exc)
+
+        b3_quotes, brapi_err = b3_future.result()
+        out["b3_quotes"] = b3_quotes
+        if brapi_err:
+            out["errors"]["brapi"] = brapi_err
+
+    # Histórico e Fibonacci D-1 do IBOV
     try:
         df = _hist("^BVSP", period="20d")
         last_day = df.index[-1].date()
@@ -248,6 +292,7 @@ def _build_shark() -> dict:
         out["ibov_amp_d1"] = round(high_d1 - low_d1, 2)
         out["ibov_last"] = round(float(df["Close"].iloc[-1]), 2)
         out["ibov_prev"] = round(float(df["Close"].iloc[-2]), 2)
+        out["fibo_ibov"] = _calc_fibonacci_levels(high_d1, low_d1)
 
         rows = []
         for idx, row in df.tail(10).iloc[::-1].iterrows():
@@ -264,12 +309,7 @@ def _build_shark() -> dict:
     except Exception as exc:
         out["errors"]["ibov"] = str(exc)
 
-    b3_quotes, brapi_err = _get_b3_quotes()
-    out["b3_quotes"] = b3_quotes
-    if brapi_err:
-        out["errors"]["brapi"] = brapi_err
-
-    out["ok"] = len(out["errors"]) < 3
+    out["ok"] = len(out["errors"]) < 4
     return out
 
 
@@ -350,7 +390,7 @@ async def _build_macro() -> dict:
     timeout = httpx.Timeout(15.0, connect=6.0)
     headers = {
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 ACPTelecomRadar/2.1",
+        "User-Agent": "Mozilla/5.0 ACPTelecomRadar/2.2",
     }
 
     async with httpx.AsyncClient(
@@ -399,7 +439,7 @@ async def _build_macro() -> dict:
             "notes": [
                 "A data exibida é a data da observação publicada pelo SGS.",
                 "As séries possuem periodicidades e defasagens distintas.",
-                "IBC-Br e séries de setor externo (balança comercial / transações correntes) são estruturais/mensais, não fluxo intradiário.",
+                "IBC-Br e séries de setor externo são estruturais/mensais, não fluxo intradiário.",
                 "Dados macroeconômicos não representam agressão ou fluxo do WIN.",
             ],
         },
@@ -437,14 +477,11 @@ async def macro():
     return await _get_macro_data()
 
 
-# ---------------------------------------------------------------------
-# Saúde
-# ---------------------------------------------------------------------
-
 @app.get("/health")
 def health():
     return {
         "status": "ok",
         "service": "ACP Radar API",
+        "version": "2.2.0",
         "time": datetime.now(SP).isoformat(timespec="seconds"),
     }
