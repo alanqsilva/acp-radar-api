@@ -1,5 +1,5 @@
 """
-ACPTelecom - Radar Financeiro (v2.2.0)
+ACPTelecom - Radar Financeiro (v2.3.0)
 Backend FastAPI para Render.
 
 Endpoints:
@@ -19,6 +19,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import httpx
+import pandas as pd
 import yfinance as yf
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,8 +28,8 @@ from fastapi.middleware.cors import CORSMiddleware
 # Configuração
 # ---------------------------------------------------------------------
 
-TTL = int(os.getenv("CACHE_TTL", "45"))  # 45s para dados globais e câmbio
-MACRO_TTL = int(os.getenv("MACRO_CACHE_TTL", "900"))  # 15 minutos
+TTL = int(os.getenv("CACHE_TTL", "45"))
+MACRO_TTL = int(os.getenv("MACRO_CACHE_TTL", "900"))
 BRAPI_TTL = int(os.getenv("BRAPI_CACHE_TTL", "90"))
 BRAPI_TOKEN = os.getenv("BRAPI_TOKEN", "").strip()
 
@@ -39,7 +40,7 @@ ORIGINS = [
 ]
 SP = ZoneInfo("America/Sao_Paulo")
 
-app = FastAPI(title="ACP Radar API", version="2.2.0")
+app = FastAPI(title="ACP Radar API", version="2.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ORIGINS or ["*"],
@@ -60,7 +61,8 @@ BCB_BASE = "https://api.bcb.gov.br/dados/serie/bcdata.sgs"
 AWESOME_FX_URL = "https://economia.awesomeapi.com.br/last/USD-BRL,EUR-BRL,GBP-BRL"
 
 BCB_SERIES = {
-    "selic": {"code": "4189", "label": "Meta Selic", "unit": "% a.a."},
+    "selic": {"code": "4189", "label": "Selic anualizada", "unit": "% a.a."},
+    "selic_meta": {"code": "432", "label": "Meta Selic (Copom)", "unit": "% a.a."},
     "ipca": {"code": "433", "label": "IPCA mensal", "unit": "% a.m."},
     "usd_ptax": {"code": "1", "label": "Dólar PTAX venda", "unit": "R$/US$"},
     "ibc_br": {"code": "24364", "label": "IBC-Br dessazonalizado", "unit": "índice"},
@@ -74,6 +76,16 @@ BCB_SERIES = {
         "label": "Transações correntes (saldo)",
         "unit": "US$ milhões",
     },
+}
+
+GLOBAL_SYMBOLS = {
+    "sp_fut": "ES=F",
+    "nq_fut": "NQ=F",
+    "vix": "^VIX",
+    "dxy": "DX-Y.NYB",
+    "ewz": "EWZ",
+    "wti": "CL=F",
+    "brent": "BZ=F",
 }
 
 B3_PESOS_TICKERS = [
@@ -94,8 +106,8 @@ B3_FREE_FALLBACK_TICKERS = ["VALE3", "PETR4", "ITUB4", "MGLU3"]
 # Helpers de Coleta e Cálculo Quantitativo
 # ---------------------------------------------------------------------
 
-def _hist(symbol: str, period: str = "20d"):
-    """Candles diários recentes de um símbolo do Yahoo Finance."""
+def _hist(symbol: str, period: str = "20d") -> pd.DataFrame:
+    """Candles diários recentes de um símbolo único (contingência)."""
     df = yf.Ticker(symbol).history(
         period=period,
         interval="1d",
@@ -107,12 +119,65 @@ def _hist(symbol: str, period: str = "20d"):
     return df
 
 
-def _last_and_pct(symbol: str) -> tuple[float, float]:
-    """Último preço e variação % contra o fechamento anterior."""
+def _last_and_pct_single(symbol: str, decimals: int = 2) -> tuple[float, float]:
     closes = _hist(symbol, period="10d")["Close"]
     last = float(closes.iloc[-1])
     previous = float(closes.iloc[-2])
-    return round(last, 2), round((last / previous - 1) * 100, 2)
+    return round(last, decimals), round((last / previous - 1) * 100, 2)
+
+
+def _fetch_global_batch() -> tuple[dict, dict]:
+    """Coleta ativos globais em lote único com contingência individual."""
+    parsed = {}
+    errors = {}
+    symbols = list(GLOBAL_SYMBOLS.values())
+
+    try:
+        raw = yf.download(
+            tickers=symbols,
+            period="10d",
+            interval="1d",
+            group_by="ticker",
+            auto_adjust=False,
+            progress=False,
+            threads=True,
+        )
+    except Exception as exc:
+        raw = None
+        errors["batch"] = str(exc)
+
+    for key, sym in GLOBAL_SYMBOLS.items():
+        dec = 3 if key == "dxy" else 2
+        extracted = False
+
+        if raw is not None and not raw.empty:
+            try:
+                if isinstance(raw.columns, pd.MultiIndex):
+                    if sym in raw.columns.get_level_values(0):
+                        closes = raw[sym]["Close"].dropna()
+                    else:
+                        closes = pd.Series(dtype=float)
+                else:
+                    closes = raw["Close"].dropna()
+
+                if len(closes) >= 2:
+                    last = float(closes.iloc[-1])
+                    prev = float(closes.iloc[-2])
+                    parsed[key] = (
+                        round(last, dec),
+                        round((last / prev - 1) * 100, 2),
+                    )
+                    extracted = True
+            except Exception:
+                extracted = False
+
+        if not extracted:
+            try:
+                parsed[key] = _last_and_pct_single(sym, decimals=dec)
+            except Exception as exc:
+                errors[key] = str(exc)
+
+    return parsed, errors
 
 
 def _calc_fibonacci_levels(high: float, low: float) -> dict:
@@ -130,7 +195,7 @@ def _calc_fibonacci_levels(high: float, low: float) -> dict:
 
 def _fetch_realtime_fx(timeout_s: float = 6.0) -> dict:
     """Busca USD/BRL, EUR/BRL e GBP/BRL em tempo real via AwesomeAPI."""
-    headers = {"Accept": "application/json", "User-Agent": "ACPTelecomRadar/2.2"}
+    headers = {"Accept": "application/json", "User-Agent": "ACPTelecomRadar/2.3"}
     with httpx.Client(timeout=timeout_s, headers=headers) as client:
         resp = client.get(AWESOME_FX_URL)
         resp.raise_for_status()
@@ -156,7 +221,7 @@ def _fetch_brapi_quotes(tickers: list[str], timeout_s: float = 10.0) -> dict:
     url = f"https://brapi.dev/api/quote/{symbols}"
     headers = {
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 ACPTelecomRadar/2.2",
+        "User-Agent": "Mozilla/5.0 ACPTelecomRadar/2.3",
     }
     if BRAPI_TOKEN:
         headers["Authorization"] = f"Bearer {BRAPI_TOKEN}"
@@ -215,116 +280,108 @@ def _get_b3_quotes() -> tuple[dict, str | None]:
 
 
 def _build_shark() -> dict:
-    """Coleta paralela dos ativos globais, câmbio real-time, IBOV e B3."""
+    """Coleta paralela otimizada: lote global, câmbio real-time, IBOV e B3."""
     now = datetime.now(SP)
     out = {
         "ok": False,
         "errors": {},
         "updated": now.isoformat(timespec="seconds"),
-        "source": "Yahoo Finance + AwesomeAPI FX + BCB SGS + brapi",
+        "source": "Yahoo Finance (Batch) + AwesomeAPI FX + BCB SGS + brapi",
     }
 
-    global_symbols = {
-        "sp_fut": "ES=F",
-        "nq_fut": "NQ=F",
-        "vix": "^VIX",
-        "dxy": "DX-Y.NYB",
-        "ewz": "EWZ",
-        "wti": "CL=F",
-        "brent": "BZ=F",
-    }
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        global_fut = pool.submit(_fetch_global_batch)
+        fx_fut = pool.submit(_fetch_realtime_fx)
+        b3_fut = pool.submit(_get_b3_quotes)
+        ibov_fut = pool.submit(_hist, "^BVSP", "20d")
 
-    def fetch_global_task(key: str, sym: str):
-        try:
-            return key, _last_and_pct(sym), None
-        except Exception as exc:
-            return key, None, str(exc)
+        global_data, global_errs = global_fut.result()
+        out["errors"].update(global_errs)
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = [
-            pool.submit(fetch_global_task, k, s)
-            for k, s in global_symbols.items()
-        ]
-        fx_future = pool.submit(_fetch_realtime_fx)
-        b3_future = pool.submit(_get_b3_quotes)
-
-        for fut in futures:
-            key, val, err = fut.result()
-            if val is not None:
-                if key == "vix":
-                    out["vix"] = val[0]
-                    out["vix_pct"] = val[1]
-                else:
-                    out[f"{key}_price"] = val[0]
-                    out[f"{key}_pct"] = val[1]
+        for key, (price, pct) in global_data.items():
+            if key == "vix":
+                out["vix"] = price
+                out["vix_pct"] = pct
             else:
-                out["errors"][key] = err
+                out[f"{key}_price"] = price
+                out[f"{key}_pct"] = pct
+                obj_key = "nasdaq" if key == "nq_fut" else key
+                out[obj_key] = {"price": price, "change": pct}
 
         try:
-            out["fx"] = fx_future.result()
+            out["fx"] = fx_fut.result()
         except Exception as exc:
             out["fx"] = {}
             out["errors"]["fx"] = str(exc)
 
-        b3_quotes, brapi_err = b3_future.result()
+        b3_quotes, brapi_err = b3_fut.result()
         out["b3_quotes"] = b3_quotes
         if brapi_err:
             out["errors"]["brapi"] = brapi_err
 
-    # Histórico e Fibonacci D-1 do IBOV
-    try:
-        df = _hist("^BVSP", period="20d")
-        last_day = df.index[-1].date()
+        try:
+            df = ibov_fut.result()
+            last_day = df.index[-1].date()
 
-        in_session = (
-            last_day == now.date()
-            and (now.hour * 60 + now.minute) < 18 * 60 + 30
-        )
-        d1_row = df.iloc[-2] if in_session else df.iloc[-1]
+            in_session = (
+                last_day == now.date()
+                and (now.hour * 60 + now.minute) < 18 * 60 + 30
+            )
+            d1_row = df.iloc[-2] if in_session else df.iloc[-1]
 
-        close_d1 = round(float(d1_row["Close"]), 2)
-        high_d1 = round(float(d1_row["High"]), 2)
-        low_d1 = round(float(d1_row["Low"]), 2)
+            close_d1 = round(float(d1_row["Close"]), 2)
+            high_d1 = round(float(d1_row["High"]), 2)
+            low_d1 = round(float(d1_row["Low"]), 2)
 
-        out["ibov_close_d1"] = close_d1
-        out["ibov_high_d1"] = high_d1
-        out["ibov_low_d1"] = low_d1
-        out["ibov_amp_d1"] = round(high_d1 - low_d1, 2)
-        out["ibov_last"] = round(float(df["Close"].iloc[-1]), 2)
-        out["ibov_prev"] = round(float(df["Close"].iloc[-2]), 2)
-        out["fibo_ibov"] = _calc_fibonacci_levels(high_d1, low_d1)
+            out["ibov_close_d1"] = close_d1
+            out["ibov_high_d1"] = high_d1
+            out["ibov_low_d1"] = low_d1
+            out["ibov_amp_d1"] = round(high_d1 - low_d1, 2)
+            out["ibov_last"] = round(float(df["Close"].iloc[-1]), 2)
+            out["ibov_prev"] = round(float(df["Close"].iloc[-2]), 2)
+            out["fibo_ibov"] = _calc_fibonacci_levels(high_d1, low_d1)
 
-        rows = []
-        for idx, row in df.tail(10).iloc[::-1].iterrows():
-            rows.append({
-                "date": idx.strftime("%d/%m/%Y"),
-                "open": round(float(row["Open"]), 2),
-                "high": round(float(row["High"]), 2),
-                "low": round(float(row["Low"]), 2),
-                "close": round(float(row["Close"]), 2),
-                "volume": int(row["Volume"]) if row["Volume"] > 0 else 0,
-            })
-        out["history"] = rows
-
-    except Exception as exc:
-        out["errors"]["ibov"] = str(exc)
+            rows = []
+            for idx, row in df.tail(10).iloc[::-1].iterrows():
+                rows.append({
+                    "date": idx.strftime("%d/%m/%Y"),
+                    "open": round(float(row["Open"]), 2),
+                    "high": round(float(row["High"]), 2),
+                    "low": round(float(row["Low"]), 2),
+                    "close": round(float(row["Close"]), 2),
+                    "volume": int(row["Volume"]) if row["Volume"] > 0 else 0,
+                })
+            out["history"] = rows
+        except Exception as exc:
+            out["errors"]["ibov"] = str(exc)
 
     out["ok"] = len(out["errors"]) < 4
     return out
 
 
-def _get_shark_data():
+def _get_shark_data() -> dict:
     with _shark_lock:
+        now_ts = time.time()
         stale = (
             _shark_cache["data"] is None
-            or time.time() - _shark_cache["t"] > TTL
+            or (now_ts - _shark_cache["t"]) > TTL
         )
         if stale:
-            data = _build_shark()
-            if data["ok"] or _shark_cache["data"] is None:
-                _shark_cache["t"] = time.time()
-                _shark_cache["data"] = data
-        return _shark_cache["data"]
+            fresh = _build_shark()
+            if fresh["ok"] or _shark_cache["data"] is None:
+                _shark_cache["t"] = now_ts
+                _shark_cache["data"] = fresh
+            else:
+                # Reaproveita cache válido anterior em caso de falha transitória
+                cached = dict(_shark_cache["data"])
+                cached["stale_fallback"] = True
+                cached["last_refresh_errors"] = fresh["errors"]
+                cached["cache_age_s"] = round(now_ts - _shark_cache["t"], 1)
+                return cached
+
+        payload = dict(_shark_cache["data"])
+        payload["cache_age_s"] = round(time.time() - _shark_cache["t"], 1)
+        return payload
 
 
 @app.get("/api/shark")
@@ -390,7 +447,7 @@ async def _build_macro() -> dict:
     timeout = httpx.Timeout(15.0, connect=6.0)
     headers = {
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 ACPTelecomRadar/2.2",
+        "User-Agent": "Mozilla/5.0 ACPTelecomRadar/2.3",
     }
 
     async with httpx.AsyncClient(
@@ -446,7 +503,7 @@ async def _build_macro() -> dict:
     }
 
 
-async def _get_macro_data():
+async def _get_macro_data() -> dict:
     async with _macro_lock:
         stale = (
             _macro_cache["data"] is None
@@ -482,6 +539,6 @@ def health():
     return {
         "status": "ok",
         "service": "ACP Radar API",
-        "version": "2.2.0",
+        "version": "2.3.0",
         "time": datetime.now(SP).isoformat(timespec="seconds"),
     }
