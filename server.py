@@ -1,10 +1,10 @@
 """
-ACPTelecom - Radar Financeiro (v2.3.0)
-Backend FastAPI para Render.
+ACPTelecom - Radar Financeiro (v2.4.0)
+Backend FastAPI para Render — Dados reais (sem valores simulados/chumbados).
 
 Endpoints:
-  GET /api/shark     -> S&P 500, Nasdaq, VIX, DXY, EWZ, Petróleo, Câmbio Real-Time,
-                        Histórico D-1 IBOV + Níveis Fibonacci + Cotações B3 (brapi)
+  GET /api/shark     -> Ativos globais, IBOV (histórico + movimento do dia),
+                        Câmbio multi-moedas (AwesomeAPI) e Cotações B3 (brapi)
   GET /api/win-flow  -> alias de compatibilidade para /api/shark
   GET /api/macro     -> Selic, IPCA, PTAX venda, IBC-Br e setor externo (BCB/SGS)
   GET /health        -> saúde da aplicação
@@ -40,7 +40,7 @@ ORIGINS = [
 ]
 SP = ZoneInfo("America/Sao_Paulo")
 
-app = FastAPI(title="ACP Radar API", version="2.3.0")
+app = FastAPI(title="ACP Radar API", version="2.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ORIGINS or ["*"],
@@ -58,7 +58,10 @@ _macro_cache = {"t": 0.0, "data": None}
 _macro_lock = asyncio.Lock()
 
 BCB_BASE = "https://api.bcb.gov.br/dados/serie/bcdata.sgs"
-AWESOME_FX_URL = "https://economia.awesomeapi.com.br/last/USD-BRL,EUR-BRL,GBP-BRL"
+AWESOME_FX_URL = (
+    "https://economia.awesomeapi.com.br/last/"
+    "USD-BRL,EUR-BRL,GBP-BRL,JPY-BRL,CAD-BRL,MXN-BRL,CNY-BRL"
+)
 
 BCB_SERIES = {
     "selic": {"code": "4189", "label": "Selic anualizada", "unit": "% a.a."},
@@ -86,6 +89,7 @@ GLOBAL_SYMBOLS = {
     "ewz": "EWZ",
     "wti": "CL=F",
     "brent": "BZ=F",
+    "us10y": "^TNX",
 }
 
 B3_PESOS_TICKERS = [
@@ -97,17 +101,26 @@ B3_PESOS_TICKERS = [
     "B3SA3",
     "ELET3",
     "BBAS3",
+    "ABEV3",
+    "RENT3",
+    "WEGE3",
+    "ITSA4",
+    "PRIO3",
+    "BPAC11",
+    "EQTL3",
+    "SUZB3",
+    "RDOR3",
+    "GGBR4",
     "MGLU3",
 ]
 B3_FREE_FALLBACK_TICKERS = ["VALE3", "PETR4", "ITUB4", "MGLU3"]
 
 
 # ---------------------------------------------------------------------
-# Helpers de Coleta e Cálculo Quantitativo
+# Helpers de Coleta Real
 # ---------------------------------------------------------------------
 
 def _hist(symbol: str, period: str = "20d") -> pd.DataFrame:
-    """Candles diários recentes de um símbolo único (contingência)."""
     df = yf.Ticker(symbol).history(
         period=period,
         interval="1d",
@@ -127,7 +140,6 @@ def _last_and_pct_single(symbol: str, decimals: int = 2) -> tuple[float, float]:
 
 
 def _fetch_global_batch() -> tuple[dict, dict]:
-    """Coleta ativos globais em lote único com contingência individual."""
     parsed = {}
     errors = {}
     symbols = list(GLOBAL_SYMBOLS.values())
@@ -181,7 +193,6 @@ def _fetch_global_batch() -> tuple[dict, dict]:
 
 
 def _calc_fibonacci_levels(high: float, low: float) -> dict:
-    """Calcula níveis institucionais de Fibonacci usados na mesa WIN/IBOV."""
     amp = high - low
     return {
         "amp": round(amp, 2),
@@ -193,35 +204,42 @@ def _calc_fibonacci_levels(high: float, low: float) -> dict:
     }
 
 
-def _fetch_realtime_fx(timeout_s: float = 6.0) -> dict:
-    """Busca USD/BRL, EUR/BRL e GBP/BRL em tempo real via AwesomeAPI."""
-    headers = {"Accept": "application/json", "User-Agent": "ACPTelecomRadar/2.3"}
+def _fetch_realtime_fx(timeout_s: float = 8.0) -> dict:
+    headers = {"Accept": "application/json", "User-Agent": "ACPTelecomRadar/2.4"}
     with httpx.Client(timeout=timeout_s, headers=headers) as client:
         resp = client.get(AWESOME_FX_URL)
         resp.raise_for_status()
         raw = resp.json()
 
+    pairs = [
+        ("USDBRL", "usd_brl", 4),
+        ("EURBRL", "eur_brl", 4),
+        ("GBPBRL", "gbp_brl", 4),
+        ("JPYBRL", "jpy_brl", 4),
+        ("CADBRL", "cad_brl", 4),
+        ("MXNBRL", "mxn_brl", 4),
+        ("CNYBRL", "cny_brl", 4),
+    ]
     fx = {}
-    for pair_key, out_key in [("USDBRL", "usd_brl"), ("EURBRL", "eur_brl"), ("GBPBRL", "gbp_brl")]:
+    for pair_key, out_key, dec in pairs:
         item = raw.get(pair_key)
-        if item:
+        if item and item.get("bid") is not None:
             fx[out_key] = {
-                "price": round(float(item["bid"]), 4),
-                "change": round(float(item["pctChange"]), 2),
-                "high": round(float(item["high"]), 4),
-                "low": round(float(item["low"]), 4),
+                "price": round(float(item["bid"]), dec),
+                "change": round(float(item.get("pctChange") or 0.0), 2),
+                "high": round(float(item["high"]), dec) if item.get("high") is not None else None,
+                "low": round(float(item["low"]), dec) if item.get("low") is not None else None,
                 "timestamp": item.get("create_date"),
             }
     return fx
 
 
-def _fetch_brapi_quotes(tickers: list[str], timeout_s: float = 10.0) -> dict:
-    """Busca cotações na brapi.dev (usa Bearer token quando configurado)."""
+def _fetch_brapi_quotes(tickers: list[str], timeout_s: float = 12.0) -> dict:
     symbols = ",".join(tickers)
     url = f"https://brapi.dev/api/quote/{symbols}"
     headers = {
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 ACPTelecomRadar/2.3",
+        "User-Agent": "Mozilla/5.0 ACPTelecomRadar/2.4",
     }
     if BRAPI_TOKEN:
         headers["Authorization"] = f"Bearer {BRAPI_TOKEN}"
@@ -247,7 +265,6 @@ def _fetch_brapi_quotes(tickers: list[str], timeout_s: float = 10.0) -> dict:
 
 
 def _get_b3_quotes() -> tuple[dict, str | None]:
-    """Retorna cotações B3 com cache e fallback seguro."""
     with _brapi_lock:
         stale = (
             _brapi_cache["data"] is None
@@ -280,13 +297,12 @@ def _get_b3_quotes() -> tuple[dict, str | None]:
 
 
 def _build_shark() -> dict:
-    """Coleta paralela otimizada: lote global, câmbio real-time, IBOV e B3."""
     now = datetime.now(SP)
     out = {
         "ok": False,
         "errors": {},
         "updated": now.isoformat(timespec="seconds"),
-        "source": "Yahoo Finance (Batch) + AwesomeAPI FX + BCB SGS + brapi",
+        "source": "Yahoo Finance + AwesomeAPI FX + BCB SGS + brapi",
     }
 
     with ThreadPoolExecutor(max_workers=4) as pool:
@@ -328,17 +344,29 @@ def _build_shark() -> dict:
                 and (now.hour * 60 + now.minute) < 18 * 60 + 30
             )
             d1_row = df.iloc[-2] if in_session else df.iloc[-1]
+            latest_row = df.iloc[-1]
 
             close_d1 = round(float(d1_row["Close"]), 2)
             high_d1 = round(float(d1_row["High"]), 2)
             low_d1 = round(float(d1_row["Low"]), 2)
 
+            ibov_last = round(float(latest_row["Close"]), 2)
+            ibov_prev = round(float(df["Close"].iloc[-2]), 2)
+            ibov_open_today = round(float(latest_row["Open"]), 2)
+            ibov_high_today = round(float(latest_row["High"]), 2)
+            ibov_low_today = round(float(latest_row["Low"]), 2)
+            ibov_day_pct = round(((ibov_last / ibov_open_today) - 1) * 100, 2) if ibov_open_today > 0 else 0.0
+
             out["ibov_close_d1"] = close_d1
             out["ibov_high_d1"] = high_d1
             out["ibov_low_d1"] = low_d1
             out["ibov_amp_d1"] = round(high_d1 - low_d1, 2)
-            out["ibov_last"] = round(float(df["Close"].iloc[-1]), 2)
-            out["ibov_prev"] = round(float(df["Close"].iloc[-2]), 2)
+            out["ibov_last"] = ibov_last
+            out["ibov_prev"] = ibov_prev
+            out["ibov_open_today"] = ibov_open_today
+            out["ibov_high_today"] = ibov_high_today
+            out["ibov_low_today"] = ibov_low_today
+            out["ibov_day_pct"] = ibov_day_pct
             out["fibo_ibov"] = _calc_fibonacci_levels(high_d1, low_d1)
 
             rows = []
@@ -372,7 +400,6 @@ def _get_shark_data() -> dict:
                 _shark_cache["t"] = now_ts
                 _shark_cache["data"] = fresh
             else:
-                # Reaproveita cache válido anterior em caso de falha transitória
                 cached = dict(_shark_cache["data"])
                 cached["stale_fallback"] = True
                 cached["last_refresh_errors"] = fresh["errors"]
@@ -391,7 +418,6 @@ def shark():
 
 @app.get("/api/win-flow")
 def win_flow():
-    """Alias para dashboards que usam o caminho /api/win-flow."""
     return _get_shark_data()
 
 
@@ -447,7 +473,7 @@ async def _build_macro() -> dict:
     timeout = httpx.Timeout(15.0, connect=6.0)
     headers = {
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 ACPTelecomRadar/2.3",
+        "User-Agent": "Mozilla/5.0 ACPTelecomRadar/2.4",
     }
 
     async with httpx.AsyncClient(
@@ -539,6 +565,6 @@ def health():
     return {
         "status": "ok",
         "service": "ACP Radar API",
-        "version": "2.3.0",
+        "version": "2.4.0",
         "time": datetime.now(SP).isoformat(timespec="seconds"),
     }
